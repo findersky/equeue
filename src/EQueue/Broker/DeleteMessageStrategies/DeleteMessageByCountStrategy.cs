@@ -1,7 +1,8 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections.Generic;
 using System.Linq;
+using ECommon.Storage;
 using ECommon.Utilities;
-using EQueue.Broker.Storage;
 
 namespace EQueue.Broker.DeleteMessageStrategies
 {
@@ -21,12 +22,12 @@ namespace EQueue.Broker.DeleteMessageStrategies
             MaxChunkCount = maxChunkCount;
         }
 
-        public IEnumerable<Chunk> GetAllowDeleteChunks(ChunkManager chunkManager, long maxMessagePosition)
+        public IEnumerable<Chunk> GetAllowDeleteChunks(ChunkManager chunkManager, Func<long> getMinConsumedMessagePositionFunc)
         {
             var chunks = new List<Chunk>();
             var allCompletedChunks = chunkManager
                 .GetAllChunks()
-                .Where(x => x.IsCompleted && x.ChunkHeader.ChunkDataEndPosition <= maxMessagePosition)
+                .Where(x => x.IsCompleted && CheckMessageConsumeOffset(x, getMinConsumedMessagePositionFunc))
                 .OrderBy(x => x.ChunkHeader.ChunkNumber)
                 .ToList();
 
@@ -42,6 +43,15 @@ namespace EQueue.Broker.DeleteMessageStrategies
             }
 
             return chunks;
+        }
+
+        private bool CheckMessageConsumeOffset(Chunk currentChunk, Func<long> getMinConsumedMessagePositionFunc)
+        {
+            if (BrokerController.Instance.Setting.DeleteMessageIgnoreUnConsumed)
+            {
+                return true;
+            }
+            return currentChunk.ChunkHeader.ChunkDataEndPosition <= getMinConsumedMessagePositionFunc();
         }
     }
 }

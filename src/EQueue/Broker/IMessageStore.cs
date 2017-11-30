@@ -1,4 +1,5 @@
-﻿using EQueue.Broker.Storage;
+﻿using System;
+using System.Collections.Generic;
 using EQueue.Protocols;
 
 namespace EQueue.Broker
@@ -11,13 +12,14 @@ namespace EQueue.Broker
         int MinChunkNum { get; }
         int MaxChunkNum { get; }
 
-        int Load();
+        void Load();
         void Start();
         void Shutdown();
-        MessageLogRecord StoreMessage(int queueId, long queueOffset, Message message);
+        void StoreMessageAsync(IQueue queue, Message message, Action<MessageLogRecord, object> callback, object parameter, string producerAddress);
+        void BatchStoreMessageAsync(IQueue queue, IEnumerable<Message> messages, Action<BatchMessageLogRecord, object> callback, object parameter, string producerAddress);
         byte[] GetMessageBuffer(long position);
         QueueMessage GetMessage(long position);
         bool IsMessagePositionExist(long position);
-        void UpdateMinConsumedMessagePosition(long minConsumedMessagePosition);
+        Func<long> GetMinConsumedMessagePositionFunc { get; set; }
     }
 }

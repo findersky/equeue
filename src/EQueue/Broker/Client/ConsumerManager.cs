@@ -2,8 +2,9 @@
 using System.Collections.Generic;
 using System.Linq;
 using ECommon.Components;
-using ECommon.Logging;
 using ECommon.Scheduling;
+using ECommon.Socketing;
+using EQueue.Protocols;
 
 namespace EQueue.Broker.Client
 {
@@ -20,25 +21,23 @@ namespace EQueue.Broker.Client
         public void Start()
         {
             _consumerGroupDict.Clear();
-            _scheduleService.StartTask("ConsumerManager.ScanNotActiveConsumer", ScanNotActiveConsumer, 1000, 1000);
+            _scheduleService.StartTask("ScanNotActiveConsumer", ScanNotActiveConsumer, 1000, 1000);
         }
         public void Shutdown()
         {
             _consumerGroupDict.Clear();
-            _scheduleService.StopTask("ConsumerManager.ScanNotActiveConsumer");
+            _scheduleService.StopTask("ScanNotActiveConsumer");
         }
-        public void RegisterConsumer(string groupName, string consumerId, IEnumerable<string> subscriptionTopics, IEnumerable<string> consumingQueues)
+        public void RegisterConsumer(string groupName, string consumerId, IEnumerable<string> subscriptionTopics, IEnumerable<MessageQueueEx> consumingQueues, ITcpConnection connection)
         {
             var consumerGroup = _consumerGroupDict.GetOrAdd(groupName, key => new ConsumerGroup(key));
-            consumerGroup.Register(consumerId);
-            consumerGroup.UpdateConsumerSubscriptionTopics(consumerId, subscriptionTopics);
-            consumerGroup.UpdateConsumerConsumingQueues(consumerId, consumingQueues);
+            consumerGroup.RegisterConsumer(connection, consumerId, subscriptionTopics.ToList(), consumingQueues.ToList());
         }
-        public void RemoveConsumer(string consumerId)
+        public void RemoveConsumer(string connectionId)
         {
             foreach (var consumerGroup in _consumerGroupDict.Values)
             {
-                consumerGroup.RemoveConsumer(consumerId);
+                consumerGroup.RemoveConsumer(connectionId);
             }
         }
         public int GetConsumerGroupCount()
@@ -49,7 +48,7 @@ namespace EQueue.Broker.Client
         {
             return _consumerGroupDict.Values.ToList();
         }
-        public int GetConsumerCount()
+        public int GetAllConsumerCount()
         {
             return GetAllConsumerGroups().Sum(x => x.GetConsumerCount());
         }
@@ -61,6 +60,24 @@ namespace EQueue.Broker.Client
                 return consumerGroup;
             }
             return null;
+        }
+        public int GetConsumerCount(string groupName)
+        {
+            ConsumerGroup consumerGroup;
+            if (_consumerGroupDict.TryGetValue(groupName, out consumerGroup))
+            {
+                return consumerGroup.GetConsumerCount();
+            }
+            return 0;
+        }
+        public int GetClientCacheMessageCount(string groupName, string topic, int queueId)
+        {
+            ConsumerGroup consumerGroup;
+            if (_consumerGroupDict.TryGetValue(groupName, out consumerGroup))
+            {
+                return consumerGroup.GetClientCacheMessageCount(topic, queueId);
+            }
+            return 0;
         }
         public bool IsConsumerActive(string consumerGroup, string consumerId)
         {
@@ -78,10 +95,6 @@ namespace EQueue.Broker.Client
                 }
             }
             return false;
-        }
-        public IEnumerable<ConsumerGroup> QueryConsumerGroup(string groupName)
-        {
-            return _consumerGroupDict.Where(x => x.Key.Contains(groupName)).Select(x => x.Value);
         }
 
         private void ScanNotActiveConsumer()

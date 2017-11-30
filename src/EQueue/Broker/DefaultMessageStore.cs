@@ -1,8 +1,10 @@
 ﻿using System;
+using System.Collections.Generic;
 using ECommon.Logging;
 using ECommon.Scheduling;
+using ECommon.Storage;
+using ECommon.Utilities;
 using EQueue.Broker.DeleteMessageStrategies;
-using EQueue.Broker.Storage;
 using EQueue.Protocols;
 using EQueue.Utils;
 
@@ -16,7 +18,10 @@ namespace EQueue.Broker
         private readonly IDeleteMessageStrategy _deleteMessageStragegy;
         private readonly IScheduleService _scheduleService;
         private readonly ILogger _logger;
-        private long _minConsumedMessagePosition;
+        private long _minConsumedMessagePosition = -1;
+        private BufferQueue<MessageLogRecord> _bufferQueue;
+        private BufferQueue<BatchMessageLogRecord> _batchMessageBufferQueue;
+        private readonly object _lockObj = new object();
 
         public long MinMessagePosition
         {
@@ -45,6 +50,8 @@ namespace EQueue.Broker
             get { return _chunkManager.GetLastChunk().ChunkHeader.ChunkNumber; }
         }
 
+        public Func<long> GetMinConsumedMessagePositionFunc { get; set; }
+
         public DefaultMessageStore(IDeleteMessageStrategy deleteMessageStragegy, IScheduleService scheduleService, ILoggerFactory loggerFactory)
         {
             _deleteMessageStragegy = deleteMessageStragegy;
@@ -52,40 +59,72 @@ namespace EQueue.Broker
             _logger = loggerFactory.Create(GetType().FullName);
         }
 
-        public int Load()
+        public void Load()
         {
-            _chunkManager = new ChunkManager(this.GetType().Name, BrokerController.Instance.Setting.MessageChunkConfig);
+            _bufferQueue = new BufferQueue<MessageLogRecord>("MessageBufferQueue", BrokerController.Instance.Setting.MessageWriteQueueThreshold, PersistMessages, _logger);
+            _batchMessageBufferQueue = new BufferQueue<BatchMessageLogRecord>("BatchMessageBufferQueue", BrokerController.Instance.Setting.BatchMessageWriteQueueThreshold, BatchPersistMessages, _logger);
+            _chunkManager = new ChunkManager("MessageChunk", BrokerController.Instance.Setting.MessageChunkConfig, BrokerController.Instance.Setting.IsMessageStoreMemoryMode);
             _chunkWriter = new ChunkWriter(_chunkManager);
             _chunkReader = new ChunkReader(_chunkManager, _chunkWriter);
 
             _chunkManager.Load(ReadMessage);
-
-            return _chunkManager.GetAllChunks().Count;
         }
         public void Start()
         {
             _chunkWriter.Open();
-            _scheduleService.StartTask(string.Format("{0}.DeleteMessages", this.GetType().Name), DeleteMessages, 5 * 1000, BrokerController.Instance.Setting.DeleteMessagesInterval);
+            _scheduleService.StartTask("DeleteMessages", DeleteMessages, 5 * 1000, BrokerController.Instance.Setting.DeleteMessagesInterval);
         }
         public void Shutdown()
         {
-            _scheduleService.StopTask(string.Format("{0}.DeleteMessages", this.GetType().Name));
+            _scheduleService.StopTask("DeleteMessages");
             _chunkWriter.Close();
             _chunkManager.Close();
         }
-        public MessageLogRecord StoreMessage(int queueId, long queueOffset, Message message)
+        public void StoreMessageAsync(IQueue queue, Message message, Action<MessageLogRecord, object> callback, object parameter, string producerAddress)
         {
-            var record = new MessageLogRecord(
-                message.Topic,
-                message.Code,
-                message.Body,
-                queueId,
-                queueOffset,
-                message.CreatedTime,
-                DateTime.Now,
-                message.Tag);
-            _chunkWriter.Write(record);
-            return record;
+            lock (_lockObj)
+            {
+                var record = new MessageLogRecord(
+                    message.Topic,
+                    message.Code,
+                    message.Body,
+                    queue.QueueId,
+                    queue.NextOffset,
+                    message.CreatedTime,
+                    DateTime.Now,
+                    message.Tag,
+                    producerAddress ?? string.Empty,
+                    callback,
+                    parameter);
+                _bufferQueue.EnqueueMessage(record);
+                queue.IncrementNextOffset();
+            }
+        }
+        public void BatchStoreMessageAsync(IQueue queue, IEnumerable<Message> messages, Action<BatchMessageLogRecord, object> callback, object parameter, string producerAddress)
+        {
+            lock (_lockObj)
+            {
+                var recordList = new List<MessageLogRecord>();
+                foreach (var message in messages)
+                {
+                    var record = new MessageLogRecord(
+                        queue.Topic,
+                        message.Code,
+                        message.Body,
+                        queue.QueueId,
+                        queue.NextOffset,
+                        message.CreatedTime,
+                        DateTime.Now,
+                        message.Tag,
+                        producerAddress ?? string.Empty,
+                        null,
+                        null);
+                    recordList.Add(record);
+                    queue.IncrementNextOffset();
+                }
+                var batchRecord = new BatchMessageLogRecord(recordList, callback, parameter);
+                _batchMessageBufferQueue.EnqueueMessage(batchRecord);
+            }
         }
         public byte[] GetMessageBuffer(long position)
         {
@@ -102,7 +141,7 @@ namespace EQueue.Broker
             if (buffer != null)
             {
                 var nextOffset = 0;
-                var messageLength = MessageUtils.DecodeInt(buffer, nextOffset, out nextOffset);
+                var messageLength = ByteUtil.DecodeInt(buffer, nextOffset, out nextOffset);
                 if (messageLength > 0)
                 {
                     var message = new QueueMessage();
@@ -124,18 +163,30 @@ namespace EQueue.Broker
             _minConsumedMessagePosition = minConsumedMessagePosition;
         }
 
+        private void PersistMessages(MessageLogRecord record)
+        {
+            _chunkWriter.Write(record);
+            record.OnPersisted();
+        }
+        private void BatchPersistMessages(BatchMessageLogRecord batchRecord)
+        {
+            foreach (var record in batchRecord.Records)
+            {
+                _chunkWriter.Write(record);
+            }
+            batchRecord.OnPersisted();
+        }
         private void DeleteMessages()
         {
-            var chunks = _deleteMessageStragegy.GetAllowDeleteChunks(_chunkManager, _minConsumedMessagePosition);
+            var chunks = _deleteMessageStragegy.GetAllowDeleteChunks(_chunkManager, GetMinConsumedMessagePositionFunc);
             foreach (var chunk in chunks)
             {
                 if (_chunkManager.RemoveChunk(chunk))
                 {
-                    _logger.InfoFormat("Message chunk #{0} is deleted, chunkPositionScale: [{1}, {2}], minConsumedMessagePosition: {3}",
+                    _logger.InfoFormat("Message chunk #{0} is deleted, chunkPositionScale: [{1}, {2}]",
                         chunk.ChunkHeader.ChunkNumber,
                         chunk.ChunkHeader.ChunkDataStartPosition,
-                        chunk.ChunkHeader.ChunkDataEndPosition,
-                        _minConsumedMessagePosition);
+                        chunk.ChunkHeader.ChunkDataEndPosition);
                 }
             }
         }

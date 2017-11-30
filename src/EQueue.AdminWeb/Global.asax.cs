@@ -1,14 +1,10 @@
-﻿using System.Reflection;
-using System.Web;
+﻿using System.Web;
 using System.Web.Mvc;
 using System.Web.Routing;
-using Autofac;
 using Autofac.Integration.Mvc;
 using ECommon.Autofac;
 using ECommon.Components;
 using ECommon.Configurations;
-using ECommon.JsonNet;
-using ECommon.Log4Net;
 
 namespace EQueue.AdminWeb
 {
@@ -25,22 +21,13 @@ namespace EQueue.AdminWeb
                 .UseAutofac()
                 .RegisterCommonComponents()
                 .UseLog4Net()
-                .UseJsonNet();
-
-            configuration.SetDefault<SendEmailService, SendEmailService>();
-            configuration.SetDefault<MessageService, MessageService>();
-            ObjectContainer.Resolve<MessageService>().Start();
-            RegisterControllers();
-        }
-
-        private static void RegisterControllers()
-        {
-            var webAssembly = Assembly.GetExecutingAssembly();
+                .UseJsonNet()
+                .RegisterControllers()
+                .RegisterServices()
+                .BuildContainer();
             var container = (ObjectContainer.Current as AutofacObjectContainer).Container;
-            var builder = new ContainerBuilder();
-            builder.RegisterControllers(webAssembly);
-            builder.Update(container);
             DependencyResolver.SetResolver(new AutofacDependencyResolver(container));
+            ObjectContainer.Resolve<MessageService>().Start();
         }
     }
 }

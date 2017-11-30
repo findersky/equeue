@@ -3,12 +3,14 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using ECommon.Components;
+using ECommon.Extensions;
 using ECommon.Logging;
 using ECommon.Remoting;
+using ECommon.Storage.Exceptions;
 using EQueue.Broker.Client;
 using EQueue.Broker.LongPolling;
-using EQueue.Broker.Storage;
 using EQueue.Protocols;
+using EQueue.Protocols.Brokers.Requests;
 using EQueue.Utils;
 
 namespace EQueue.Broker.RequestHandlers
@@ -34,6 +36,11 @@ namespace EQueue.Broker.RequestHandlers
 
         public RemotingResponse HandleRequest(IRequestHandlerContext context, RemotingRequest remotingRequest)
         {
+            if (BrokerController.Instance.IsCleaning)
+            {
+                return BuildBrokerIsCleaningResponse(remotingRequest);
+            }
+
             var request = DeserializePullMessageRequest(remotingRequest.Body);
             var topic = request.MessageQueue.Topic;
             var tags = request.Tags;
@@ -41,9 +48,15 @@ namespace EQueue.Broker.RequestHandlers
             var pullOffset = request.QueueOffset;
 
             //如果消费者第一次过来拉取消息，则计算下一个应该拉取的位置，并返回给消费者
+            var nextConsumeOffset = 0L;
             if (pullOffset < 0)
             {
-                var nextConsumeOffset = GetNextConsumeOffset(topic, queueId, request.ConsumerGroup, request.ConsumeFromWhere);
+                nextConsumeOffset = GetNextConsumeOffset(topic, queueId, request.ConsumerGroup, request.ConsumeFromWhere);
+                return BuildNextOffsetResetResponse(remotingRequest, nextConsumeOffset);
+            }
+            //如果用户人工指定了下次要拉取的位置，则返回该位置给消费者并清除该指定的位置
+            else if (_offsetStore.TryFetchNextConsumeOffset(topic, queueId, request.ConsumerGroup, out nextConsumeOffset))
+            {
                 return BuildNextOffsetResetResponse(remotingRequest, nextConsumeOffset);
             }
 
@@ -75,6 +88,7 @@ namespace EQueue.Broker.RequestHandlers
                         request.SuspendPullRequestMilliseconds,
                         ExecutePullRequest,
                         ExecutePullRequest,
+                        ExecuteNoNewMessagePullRequest,
                         ExecuteReplacedPullRequest);
                     _suspendedPullRequestManager.SuspendPullRequest(pullRequest);
                     return null;
@@ -115,9 +129,8 @@ namespace EQueue.Broker.RequestHandlers
                 {
                     messagePosition = queue.GetMessagePosition(queueOffset, out tagCode);
                 }
-                catch (ChunkNotExistException ex)
+                catch (ChunkNotExistException)
                 {
-                    _logger.Error(string.Format("Queue chunk not exist, topic: {0}, queueId: {1}, queueOffset: {2}", topic, queueId, queueOffset), ex);
                     break;
                 }
                 catch (ChunkReadException ex)
@@ -148,7 +161,7 @@ namespace EQueue.Broker.RequestHandlers
                         var tagList = tags.Split(new char[] { '|' }, StringSplitOptions.RemoveEmptyEntries);
                         foreach (var tag in tagList)
                         {
-                            if (tag == "*" || tag.GetHashcode2() == tagCode)
+                            if (tag == "*" || tag.GetStringHashcode() == tagCode)
                             {
                                 messages.Add(message);
                                 break;
@@ -160,14 +173,21 @@ namespace EQueue.Broker.RequestHandlers
                 }
                 catch (ChunkNotExistException ex)
                 {
-                    _logger.Error(string.Format("Message chunk not exist, topic: {0}, queueId: {1}, queueOffset: {2}", topic, queueId, queueOffset), ex);
                     messageChunkNotExistException = ex;
                     break;
                 }
                 catch (ChunkReadException ex)
                 {
+                    //遇到这种异常，说明某个消息在队列(queue chunk)中存在，但在message chunk中不存在；
+                    //出现这种现象的原因是由于，默认情况下，message chunk, queue chunk都是异步持久化的，默认定时100ms刷盘一次；
+                    //所以，当broker正好在被关闭的时刻，假如queue chunk刷盘成功了，而对应的消息在message chunk中还未来得及刷盘，那就意味着这部分消息就丢失了；
+                    //那当broker下次重启后，丢失的那些消息就找不到了，无法被消费；所以当Consumer拉取这些消息时，就会抛这个异常；
+                    //这种情况下，重试拉取已经没有意义，故我们能做的是记录错误日志，记录下来哪个topic下的哪个queue的哪个位置的消息找不到了；这样我们就知道哪些消息丢失了；
+                    //然后我们继续拉取该队列的后续的消息。
+                    //如果大家希望避免这种问题，如果你的业务场景消息量不大或者使用了SSD硬盘，则建议你使用同步算盘的方式，这样可以确保消息不丢，
+                    //大家通过配置ChunkManagerConfig.SyncFlush=true来实现；
                     _logger.Error(string.Format("Message chunk read failed, topic: {0}, queueId: {1}, queueOffset: {2}", topic, queueId, queueOffset), ex);
-                    throw;
+                    queueOffset++;
                 }
             }
 
@@ -187,6 +207,7 @@ namespace EQueue.Broker.RequestHandlers
             var queueMinOffset = _queueStore.GetQueueMinOffset(topic, queueId);
             if (pullOffset < queueMinOffset)
             {
+                _logger.InfoFormat("Reset next pullOffset to queueMinOffset, [topic: {0}, queueId: {1}, pullOffset: {2}, queueMinOffset: {3}]", topic, queueId, pullOffset, queueMinOffset);
                 return new PullMessageResult
                 {
                     Status = PullStatus.NextOffsetReset,
@@ -196,24 +217,18 @@ namespace EQueue.Broker.RequestHandlers
             //pullOffset太大
             else if (pullOffset > queueCurrentOffset + 1)
             {
+                _logger.InfoFormat("Reset next pullOffset to queueCurrentOffset, [topic: {0}, queueId: {1}, pullOffset: {2}, queueCurrentOffset: {3}]", topic, queueId, pullOffset, queueCurrentOffset);
                 return new PullMessageResult
                 {
                     Status = PullStatus.NextOffsetReset,
                     NextBeginOffset = queueCurrentOffset + 1
                 };
             }
-            //如果正好等于queueMaxOffset+1，属于正常情况，表示当前队列没有新消息，告诉客户端没有新消息即可
-            else if (pullOffset == queueCurrentOffset + 1)
-            {
-                return new PullMessageResult
-                {
-                    Status = PullStatus.NoNewMessage
-                };
-            }
             //如果当前的pullOffset对应的Message的Chunk文件不存在，则需要重新计算下一个pullOffset
             else if (messageChunkNotExistException != null)
             {
                 var nextPullOffset = CalculateNextPullOffset(queue, pullOffset, queueCurrentOffset);
+                _logger.InfoFormat("Reset next pullOffset to calculatedNextPullOffset, [topic: {0}, queueId: {1}, pullOffset: {2}, calculatedNextPullOffset: {3}]", topic, queueId, pullOffset, nextPullOffset);
                 return new PullMessageResult
                 {
                     Status = PullStatus.NextOffsetReset,
@@ -287,6 +302,14 @@ namespace EQueue.Broker.RequestHandlers
             }
             SendRemotingResponse(pullRequest, BuildIgnoredResponse(pullRequest.RemotingRequest));
         }
+        private void ExecuteNoNewMessagePullRequest(PullRequest pullRequest)
+        {
+            if (!IsPullRequestValid(pullRequest))
+            {
+                return;
+            }
+            SendRemotingResponse(pullRequest, BuildNoNewMessageResponse(pullRequest.RemotingRequest));
+        }
         private bool IsPullRequestValid(PullRequest pullRequest)
         {
             try
@@ -313,6 +336,10 @@ namespace EQueue.Broker.RequestHandlers
         private RemotingResponse BuildQueueNotExistResponse(RemotingRequest remotingRequest)
         {
             return RemotingResponseFactory.CreateResponse(remotingRequest, (short)PullStatus.QueueNotExist);
+        }
+        private RemotingResponse BuildBrokerIsCleaningResponse(RemotingRequest remotingRequest)
+        {
+            return RemotingResponseFactory.CreateResponse(remotingRequest, (short)PullStatus.BrokerIsCleaning);
         }
         private RemotingResponse BuildFoundResponse(RemotingRequest remotingRequest, IEnumerable<byte[]> messages)
         {

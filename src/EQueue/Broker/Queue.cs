@@ -1,51 +1,53 @@
-﻿using System;
-using System.Collections.Concurrent;
-using System.IO;
+﻿using System.IO;
 using System.Linq;
 using ECommon.Components;
+using ECommon.Extensions;
 using ECommon.Logging;
 using ECommon.Serializing;
-using EQueue.Broker.Storage;
-using EQueue.Utils;
+using ECommon.Storage;
+using EQueue.Protocols.Brokers;
 
 namespace EQueue.Broker
 {
-    public class Queue
+    public interface IQueue
+    {
+        string Topic { get; }
+        int QueueId { get; }
+        long NextOffset { get; }
+        long IncrementNextOffset();
+    }
+    public class Queue : IQueue
     {
         private const string QueueSettingFileName = "queue.setting";
         private readonly ChunkWriter _chunkWriter;
         private readonly ChunkReader _chunkReader;
         private readonly ChunkManager _chunkManager;
-        private long _nextOffset = 0;
         private readonly IJsonSerializer _jsonSerializer;
-        private QueueSetting _setting;
         private readonly string _queueSettingFile;
+        private QueueSetting _setting;
+        private long _nextOffset = 0;
         private ILogger _logger;
 
         public string Topic { get; private set; }
         public int QueueId { get; private set; }
         public long NextOffset { get { return _nextOffset; } }
         public QueueSetting Setting { get { return _setting; } }
-        public string Key { get; private set; }
+        public QueueKey Key { get; private set; }
 
         public Queue(string topic, int queueId)
         {
             Topic = topic;
             QueueId = queueId;
-            Key = QueueKeyUtil.CreateQueueKey(topic, queueId);
+            Key = new QueueKey(topic, queueId);
 
             _jsonSerializer = ObjectContainer.Resolve<IJsonSerializer>();
-            _chunkManager = new ChunkManager(Key, BrokerController.Instance.Setting.QueueChunkConfig, Topic + @"\" + QueueId);
+            _chunkManager = new ChunkManager("QueueChunk-" + Key.ToString(), BrokerController.Instance.Setting.QueueChunkConfig, BrokerController.Instance.Setting.IsMessageStoreMemoryMode, Topic + @"\" + QueueId);
             _chunkWriter = new ChunkWriter(_chunkManager);
             _chunkReader = new ChunkReader(_chunkManager, _chunkWriter);
             _queueSettingFile = Path.Combine(_chunkManager.ChunkPath, QueueSettingFileName);
             _logger = ObjectContainer.Resolve<ILoggerFactory>().Create(this.GetType().FullName);
         }
 
-        public void CleanChunks()
-        {
-            _chunkManager.Clean();
-        }
         public void Load()
         {
             _setting = LoadQueueSetting();
@@ -75,7 +77,7 @@ namespace EQueue.Broker
         }
         public void AddMessage(long messagePosition, string messageTag)
         {
-            _chunkWriter.Write(new QueueLogRecord(messagePosition + 1, messageTag.GetHashcode2()));
+            _chunkWriter.Write(new QueueLogRecord(messagePosition + 1, messageTag.GetStringHashcode()));
         }
         public long GetMessagePosition(long queueOffset, out int tagCode, bool autoCache = true)
         {
@@ -107,9 +109,11 @@ namespace EQueue.Broker
             SaveQueueSetting();
 
             Close();
-            CleanChunks();
 
-            Directory.Delete(_chunkManager.ChunkPath, true);
+            if (!_chunkManager.IsMemoryMode)
+            {
+                Directory.Delete(_chunkManager.ChunkPath, true);
+            }
         }
         public long IncrementNextOffset()
         {
@@ -158,6 +162,10 @@ namespace EQueue.Broker
         }
         private QueueSetting LoadQueueSetting()
         {
+            if (_chunkManager.IsMemoryMode)
+            {
+                return null;
+            }
             if (!Directory.Exists(_chunkManager.ChunkPath))
             {
                 Directory.CreateDirectory(_chunkManager.ChunkPath);
@@ -177,11 +185,15 @@ namespace EQueue.Broker
         }
         private void SaveQueueSetting()
         {
+            if (_chunkManager.IsMemoryMode)
+            {
+                return;
+            }
             if (!Directory.Exists(_chunkManager.ChunkPath))
             {
                 Directory.CreateDirectory(_chunkManager.ChunkPath);
             }
-            using (var stream = new FileStream(_queueSettingFile, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite))
+            using (var stream = new FileStream(_queueSettingFile, FileMode.Create, FileAccess.ReadWrite, FileShare.ReadWrite))
             {
                 using (var writer = new StreamWriter(stream))
                 {

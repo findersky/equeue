@@ -1,14 +1,11 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Configuration;
 using System.Net;
-using System.Threading;
-using ECommon.Autofac;
 using ECommon.Components;
-using ECommon.JsonNet;
-using ECommon.Log4Net;
-using ECommon.Logging;
-using ECommon.Scheduling;
+using ECommon.Configurations;
 using ECommon.Socketing;
+using ECommon.Utilities;
 using EQueue.Clients.Consumers;
 using EQueue.Configurations;
 using EQueue.Protocols;
@@ -33,22 +30,28 @@ namespace QuickStart.ConsumerClient
                 .UseLog4Net()
                 .UseJsonNet()
                 .RegisterUnhandledExceptionHandler()
-                .RegisterEQueueComponents();
+                .RegisterEQueueComponents()
+                .BuildContainer();
 
-            var address = ConfigurationManager.AppSettings["BrokerAddress"];
-            var brokerAddress = string.IsNullOrEmpty(address) ? SocketUtils.GetLocalIPV4() : IPAddress.Parse(address);
+            var clusterName = ConfigurationManager.AppSettings["ClusterName"];
+            var consumerName = ConfigurationManager.AppSettings["ConsumerName"];
+            var consumerGroup = ConfigurationManager.AppSettings["ConsumerGroup"];
+            var address = ConfigurationManager.AppSettings["NameServerAddress"];
+            var topic = ConfigurationManager.AppSettings["Topic"];
+            var nameServerAddress = string.IsNullOrEmpty(address) ? SocketUtils.GetLocalIPV4() : IPAddress.Parse(address);
             var clientCount = int.Parse(ConfigurationManager.AppSettings["ClientCount"]);
             var setting = new ConsumerSetting
             {
+                ClusterName = clusterName,
                 ConsumeFromWhere = ConsumeFromWhere.FirstOffset,
-                BrokerAddress = new IPEndPoint(brokerAddress, 5001),
-                BrokerAdminAddress = new IPEndPoint(brokerAddress, 5002)
+                MessageHandleMode = MessageHandleMode.Sequential,
+                NameServerList = new List<IPEndPoint> { new IPEndPoint(nameServerAddress, 9493) }
             };
             var messageHandler = new MessageHandler();
             for (var i = 1; i <= clientCount; i++)
             {
-                new Consumer(ConfigurationManager.AppSettings["ConsumerGroup"], setting)
-                    .Subscribe(ConfigurationManager.AppSettings["Topic"])
+                new Consumer(consumerGroup, setting, consumerName)
+                    .Subscribe(topic)
                     .SetMessageHandler(messageHandler)
                     .Start();
             }
@@ -56,45 +59,18 @@ namespace QuickStart.ConsumerClient
 
         class MessageHandler : IMessageHandler
         {
-            private long _previusHandledCount;
-            private long _handledCount;
-            private long _calculateCount = 0;
-            private IScheduleService _scheduleService;
-            private ILogger _logger;
-            private ILogger _throughputLogger;
+            private readonly IPerformanceService _performanceService;
 
             public MessageHandler()
             {
-                _scheduleService = ObjectContainer.Resolve<IScheduleService>();
-                _scheduleService.StartTask("Program.PrintThroughput", PrintThroughput, 1000, 1000);
-                _logger = ObjectContainer.Resolve<ILoggerFactory>().Create(typeof(Program).Name);
-                _throughputLogger = ObjectContainer.Resolve<ILoggerFactory>().Create("throughput");
+                _performanceService = ObjectContainer.Resolve<IPerformanceService>();
+                _performanceService.Initialize("TotalReceived").Start();
             }
 
             public void Handle(QueueMessage message, IMessageContext context)
             {
-                Interlocked.Increment(ref _handledCount);
+                _performanceService.IncrementKeyCount("default", (DateTime.Now - message.CreatedTime).TotalMilliseconds);
                 context.OnMessageHandled(message);
-            }
-
-            private void PrintThroughput()
-            {
-                var totalHandledCount = _handledCount;
-                var throughput = totalHandledCount - _previusHandledCount;
-                _previusHandledCount = totalHandledCount;
-                if (throughput > 0)
-                {
-                    _calculateCount++;
-                }
-
-                var average = 0L;
-                if (_calculateCount > 0)
-                {
-                    average = totalHandledCount / _calculateCount;
-                }
-
-                _logger.InfoFormat("totalReceived: {0}, throughput: {1}/s, average: {2}", totalHandledCount, throughput, average);
-                _throughputLogger.Info(throughput);
             }
         }
     }
